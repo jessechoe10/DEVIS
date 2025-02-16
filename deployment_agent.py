@@ -1,130 +1,91 @@
-import docker
-from typing import Dict, List, Optional
-import yaml
 import os
-from dataclasses import dataclass
-from datetime import datetime
+import requests
+from dotenv import load_dotenv
+import json
 
-@dataclass
-class DeploymentConfig:
-    app_name: str
-    environment: str
-    docker_image: str
-    ports: Dict[str, str]
-    env_vars: Dict[str, str]
-    volumes: Optional[List[str]] = None
-
-@dataclass
-class DeploymentStatus:
-    status: str
-    timestamp: datetime
-    details: Dict[str, any]
+load_dotenv()
 
 class DeploymentAgent:
     def __init__(self):
-        self.docker_client = docker.from_env()
-        self.deployments: Dict[str, DeploymentStatus] = {}
-        self.environments = ['development', 'staging', 'production']
-        self.current_configs: Dict[str, DeploymentConfig] = {}
-
-    def process_request(self, prompt: str):
-        print(f"DeploymentAgent processing request: {prompt}")
-        return "DeploymentAgent response"
-
-    def load_deployment_config(self, config_path: str) -> DeploymentConfig:
-        """Load deployment configuration from a YAML file"""
-        try:
-            with open(config_path, 'r') as f:
-                config_data = yaml.safe_load(f)
-                return DeploymentConfig(**config_data)
-        except Exception as e:
-            raise ValueError(f"Error loading deployment config: {e}")
-
-    def deploy_container(self, config: DeploymentConfig) -> DeploymentStatus:
-        """Deploy a Docker container based on the configuration"""
-        try:
-            # Pull the Docker image
-            self.docker_client.images.pull(config.docker_image)
-
-            # Create and start the container
-            container = self.docker_client.containers.run(
-                config.docker_image,
-                name=f"{config.app_name}-{config.environment}",
-                ports=config.ports,
-                environment=config.env_vars,
-                volumes=config.volumes,
-                detach=True
-            )
-
-            status = DeploymentStatus(
-                status="deployed",
-                timestamp=datetime.utcnow(),
-                details={"container_id": container.id}
-            )
-            self.deployments[config.app_name] = status
-            return status
-        except Exception as e:
-            status = DeploymentStatus(
-                status="failed",
-                timestamp=datetime.utcnow(),
-                details={"error": str(e)}
-            )
-            self.deployments[config.app_name] = status
-            raise RuntimeError(f"Deployment failed: {e}")
-
-    def get_deployment_status(self, app_name: str) -> Optional[DeploymentStatus]:
-        """Get the current deployment status of an application"""
-        return self.deployments.get(app_name)
-
-    def stop_deployment(self, app_name: str) -> DeploymentStatus:
-        """Stop a deployed application"""
-        try:
-            container_name = f"{app_name}-{self.current_configs[app_name].environment}"
-            container = self.docker_client.containers.get(container_name)
-            container.stop()
+        self.github_token = os.getenv("GITHUB_TOKEN")
+        self.vercel_token = os.getenv("VERCEL_TOKEN")
+        self.github_headers = {
+            "Authorization": f"token {self.github_token}",
+            "Accept": "application/vnd.github.v3+json"
+        }
+        self.vercel_headers = {
+            "Authorization": f"Bearer {self.vercel_token}"
+        }
+        
+    def create_github_repo(self, repo_name, description=""):
+        """Create a new GitHub repository"""
+        url = "https://api.github.com/user/repos"
+        data = {
+            "name": repo_name,
+            "description": description,
+            "private": False
+        }
+        
+        response = requests.post(url, headers=self.github_headers, json=data)
+        return response.json() if response.status_code == 201 else None
+        
+    def push_to_github(self, repo_name, files):
+        """Push generated files to GitHub"""
+        base_url = f"https://api.github.com/repos/{repo_name}/contents"
+        
+        for file_path, content in files.items():
+            data = {
+                "message": f"Add {file_path}",
+                "content": content.encode('utf-8').hex(),
+                "branch": "main"
+            }
             
-            status = DeploymentStatus(
-                status="stopped",
-                timestamp=datetime.utcnow(),
-                details={"container_id": container.id}
-            )
-            self.deployments[app_name] = status
-            return status
-        except Exception as e:
-            status = DeploymentStatus(
-                status="error",
-                timestamp=datetime.utcnow(),
-                details={"error": str(e)}
-            )
-            self.deployments[app_name] = status
-            raise RuntimeError(f"Failed to stop deployment: {e}")
-
-    def validate_environment(self, environment: str) -> bool:
-        """Validate if the environment is supported"""
-        return environment in self.environments
-
-    def get_logs(self, app_name: str, tail: int = 100) -> str:
-        """Get logs from a deployed application"""
-        try:
-            container_name = f"{app_name}-{self.current_configs[app_name].environment}"
-            container = self.docker_client.containers.get(container_name)
-            return container.logs(tail=tail).decode('utf-8')
-        except Exception as e:
-            raise RuntimeError(f"Failed to get logs: {e}")
-
-    def create_backup(self, app_name: str) -> str:
-        """Create a backup of the application state"""
-        try:
-            timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-            backup_path = f"backups/{app_name}_{timestamp}"
-            os.makedirs(backup_path, exist_ok=True)
+            response = requests.put(f"{base_url}/{file_path}", 
+                                  headers=self.github_headers, 
+                                  json=data)
             
-            # Save current configuration
-            config = self.current_configs.get(app_name)
-            if config:
-                with open(f"{backup_path}/config.yaml", 'w') as f:
-                    yaml.dump(config.__dict__, f)
+            if response.status_code not in [201, 200]:
+                print(f"Error pushing {file_path}: {response.json()}")
+                
+    def deploy_to_vercel(self, github_repo_url):
+        """Deploy the GitHub repository to Vercel"""
+        url = "https://api.vercel.com/v9/projects"
+        
+        # Create project
+        project_data = {
+            "name": github_repo_url.split("/")[-1],
+            "gitRepository": {
+                "type": "github",
+                "repo": github_repo_url
+            }
+        }
+        
+        response = requests.post(url, headers=self.vercel_headers, json=project_data)
+        if response.status_code != 201:
+            print(f"Error creating Vercel project: {response.json()}")
+            return None
             
-            return backup_path
-        except Exception as e:
-            raise RuntimeError(f"Failed to create backup: {e}")
+        project_id = response.json()["id"]
+        
+        # Trigger deployment
+        deploy_url = f"https://api.vercel.com/v13/deployments"
+        deploy_data = {
+            "projectId": project_id,
+            "target": "production"
+        }
+        
+        response = requests.post(deploy_url, headers=self.vercel_headers, json=deploy_data)
+        return response.json() if response.status_code == 201 else None
+
+if __name__ == "__main__":
+    agent = DeploymentAgent()
+    # Example usage
+    repo = agent.create_github_repo("test-ui-project")
+    if repo:
+        files = {
+            "index.js": "console.log('Hello World')",
+            "styles.css": "body { margin: 0; }"
+        }
+        agent.push_to_github(repo["full_name"], files)
+        deployment = agent.deploy_to_vercel(repo["html_url"])
+        print("Deployment status:", deployment)
